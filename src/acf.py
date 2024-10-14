@@ -5,7 +5,7 @@ from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 
 # Import messages and services
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Header
 from stamped_std_msgs.msg import Float32Stamped
 from ferrobotics_acf.srv import SetFloat, SetDuration
 from ferrobotics_acf.msg import ACFTelem, ACFTelemStamped
@@ -13,6 +13,7 @@ from sensor_msgs.msg import JointState
 
 import socket
 import sys
+import numpy as np 
 
 bytes_args = ()
 if sys.version_info.major >= 3:
@@ -64,6 +65,10 @@ class FerroboticsACF(Node):
         self.declare_parameter('frequency', 0)
         self.declare_parameter('joint_name', "")
 
+        self.declare_parameter('control_p', 0.0)
+        self.declare_parameter('control_i', 0.0)
+        self.declare_parameter('control_d', 0.0)
+
         self.ip = self.get_parameter('ip').get_parameter_value().string_value
         self.port = self.get_parameter('port').get_parameter_value().integer_value
         self.authentication = self.get_parameter('authentication').get_parameter_value().string_value
@@ -77,7 +82,20 @@ class FerroboticsACF(Node):
         assert self.check_payload(self.payload), "Invalid payload value"
         self.frequency = self.get_parameter('frequency').get_parameter_value().integer_value
         self.joint_name = self.get_parameter('joint_name').get_parameter_value().string_value
-        self.force = 0
+        self.target_force = 0.
+
+        self.control_p = self.get_parameter('control_p').get_parameter_value().double_value 
+        self.control_i = self.get_parameter('control_i').get_parameter_value().double_value 
+        self.control_d = self.get_parameter('control_d').get_parameter_value().double_value 
+
+        self.dt = rclpy.duration.Duration(nanoseconds=1e8)
+        self.t = self.get_clock().now()
+        # Initialize integral sum to 0
+        self.force, self.force_prev = 0., 0.
+        self.decaying_integral_sum = 0.0
+        self.integral_limit = 10.0  # Limit for the integral to prevent windup
+        self.w_old = 0.95
+
 
     def check_force(self, force):
         return -self.f_max <= force <= self.f_max
@@ -131,8 +149,14 @@ class FerroboticsACF(Node):
             pass
 
     def timer_callback(self):
-        self.send_command(self.force)
-        self.initial_force = self.force
+        
+        force = self.calc_force_input()
+
+        # self.command_publisher.publish(Float32Stamped(data=force, header=Header(stamp=self.get_clock().now().to_msg())))
+        # self.set_force_publisher.publish(Float32Stamped(data=self.target_force, header=Header(stamp=self.get_clock().now().to_msg())))
+
+        self.send_command(force)
+        self.initial_force = self.target_force
         telem = self.handle_telem()
         if self.joint_state_pub is not None:
             msg = JointState()
@@ -143,13 +167,44 @@ class FerroboticsACF(Node):
             # msg.effort = [] # TODO Send the current force at the joint
             self.joint_state_pub.publish(msg)
 
+    def calc_force_input(self):
+        # Calculate the derivative of the force
+        df = (self.force - self.force_prev) / (self.dt.nanoseconds/10**9) # dt in seconds 
+        
+        # Calculate the force error (difference between target and current force)
+        f_error = self.target_force - self.force
+
+        # Update the integral sum (integral term)
+        self.decaying_integral_sum = self.decaying_integral_sum * self.w_old + (1-self.w_old) * f_error * (self.dt.nanoseconds / 10**9)  # Accumulate the error over time
+        
+        # Anti-windup: Clamp the integral sum to avoid excessive growth
+        self.decaying_integral_sum = np.clip(self.decaying_integral_sum, -self.integral_limit, self.integral_limit)
+
+        # Calculate the final force input using PID control
+        force = (
+            self.target_force +                           # Base target force
+            f_error * self.control_p +                    # Proportional term
+            self.decaying_integral_sum * self.control_i -          # Integral term
+            df * self.control_d                           # Derivative term
+        )
+        
+        # Clip the force to the maximum allowable force
+        return np.clip(force, -self.f_max, self.f_max)
+
     def command_handler(self, msg):
-        self.force = msg.data
+        self.target_force = msg.data
         if self.frequency <= 0:
             self.timer_callback()
-
     def handle_telem(self) -> ACFTelem:
         data, stamp = self.recv_telem()
+
+        self.force_prev = self.force
+        self.force = float(data[1])
+
+        current_t = rclpy.time.Time.from_msg(stamp)
+        self.dt = current_t - self.t 
+        self.t = current_t
+
         telem_stamped = ACFTelemStamped()
         telem_stamped.header.stamp = stamp
         telem = ACFTelem()
@@ -211,6 +266,9 @@ class FerroboticsACF(Node):
         self.create_service(SetFloat, '~/set_payload', self.set_payload)
         self.create_service(SetFloat, '~/set_f_zero', self.set_f_zero)
         self.create_service(SetDuration, '~/set_t_ramp', self.set_t_ramp)
+
+        self.command_publisher = self.create_publisher(Float32Stamped, 'command_f', 1)
+        self.set_force_publisher = self.create_publisher(Float32Stamped, 'set_f', 1)
         if self.frequency > 0:
             self.create_timer(1.0 / self.frequency, self.timer_callback)
         if self.joint_name != "":
